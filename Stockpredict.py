@@ -1,80 +1,96 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS  # Import CORS
+import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import load_model
+import seaborn as sns
 from datetime import datetime, timedelta
-import io
-import base64
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+# Load Model & Scaler
+model = load_model("stock_model.keras")
+scaler = np.load("scaler.npy", allow_pickle=True).item()
 
-# Load the trained LSTM model
-model = load_model("bse_stock_lstm_model.h5")  # Make sure this file exists
+# Streamlit UI Configuration
+st.set_page_config(page_title="Stock Price Prediction", layout="wide")
+st.title("📈 Stock Price Prediction App")
+st.sidebar.header("🔍 Select Stock & Settings")
 
+# User Input: Stock Symbol
+stock_symbol = st.sidebar.text_input("Enter BSE stock symbol (e.g., RELIANCE.BO):", "RELIANCE.BO")
 
+# Fetch Stock Data
+@st.cache_data
 def fetch_stock_data(symbol):
-    start_date = (datetime.today() - timedelta(days=3650)).strftime('%Y-%m-%d')
-    end_date = datetime.today().strftime('%Y-%m-%d')
-    df = yf.download(symbol, start=start_date, end=end_date)
+    df = yf.download(symbol, period="10y")
+    df.reset_index(inplace=True)
     return df
 
+df = fetch_stock_data(stock_symbol)
 
-def prepare_data(df):
-    df_close = df[['Close']]
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    df_scaled = scaler.fit_transform(df_close)
+# Stop if no data is found
+if df.empty:
+    st.error("❌ No data found. Try another stock.")
+    st.stop()
 
-    time_step = 60
-    X = df_scaled[-time_step:].reshape(1, time_step, 1)
+# Convert Date Column
+df['Date'] = pd.to_datetime(df['Date'])
+df_close = df[['Close']].values
+df_scaled = scaler.transform(df_close)
 
-    future_preds = []
-    for _ in range(730):  # Predict for 2 years
-        pred = model.predict(X)[0][0]
-        future_preds.append(pred)
-        X = np.append(X[:, 1:, :], [[[pred]]], axis=1)
+# User Input: Future Months
+future_months = st.sidebar.slider("📅 Predict Future Months:", 1, 24, 12)
 
-    future_preds = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
-    future_dates = [df.index[-1] + timedelta(days=i) for i in range(1, 731)]
+# Prediction Process
+time_step = 60
+future_inputs = df_scaled[-time_step:].reshape(1, time_step, 1)
+future_preds, future_dates = [], []
+last_date = df['Date'].iloc[-1]
 
-    return df, future_dates, future_preds
+for i in range(future_months):
+    pred = model.predict(future_inputs, verbose=0)[0][0]
+    future_preds.append(pred)
+    future_inputs = np.append(future_inputs[:, 1:, :], [[[pred]]], axis=1)
+    next_month = last_date + timedelta(days=30 * (i + 1))
+    future_dates.append(next_month)
 
+# Convert Predictions to Original Scale
+future_preds = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
 
-def plot_stock_data(df, future_dates, future_preds):
-    plt.figure(figsize=(12, 5))
-    plt.plot(df.index, df['Close'], label="Historical Prices")
-    plt.plot(future_dates, future_preds, label="Predicted Prices (Next 2 Years)", linestyle="dashed")
-    plt.xlabel("Date")
-    plt.ylabel("Stock Price")
-    plt.title("Stock Price Prediction")
-    plt.legend()
+# Create Prediction DataFrame
+pred_df = pd.DataFrame({'Date': future_dates, 'Predicted Close': future_preds.flatten()})
 
-    img = io.BytesIO()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    return base64.b64encode(img.getvalue()).decode()
+# Select Month for Display
+months = [date.strftime('%B %Y') for date in future_dates]
+selected_month = st.sidebar.selectbox("📅 Select a month for prediction:", months)
+selected_index = months.index(selected_month)
+selected_price = future_preds[selected_index][0]
 
+# ✅ Bar Chart (Replaces Line Chart)
+fig, ax = plt.subplots(figsize=(12, 6))
+sns.set_style("whitegrid")
 
-@app.route('/predict', methods=['GET'])
-def predict_stock():
-    stock_symbol = request.args.get('symbol', '').replace('BSE:', '') + '.BO'
+# Plot Historical Prices as Bars
+ax.bar(df['Date'][-50:], df['Close'][-50:], label="Historical Prices", color="#0174DF", alpha=0.7)
 
-    try:
-        df = fetch_stock_data(stock_symbol)
-        df, future_dates, future_preds = prepare_data(df)
-        img_base64 = plot_stock_data(df, future_dates, future_preds)
+# Plot Predicted Prices as Bars
+ax.bar(pred_df['Date'], pred_df['Predicted Close'], label="Predicted Prices", color="#DF0101", alpha=0.7)
 
-        return jsonify({
-            "symbol": stock_symbol,
-            "prediction_chart": f"data:image/png;base64,{img_base64}"
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+# Highlight Selected Prediction as a Separate Bar
+ax.bar(pred_df['Date'].iloc[selected_index], selected_price, color="black", label=f"Prediction for {selected_month}")
 
+# Customize Graph Appearance
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.set_xlabel("Date", fontsize=12)
+ax.set_ylabel("Closing Price", fontsize=12)
+ax.set_title(stock_symbol, fontsize=16)
+ax.legend()
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# ✅ Display Bar Chart in Streamlit
+st.pyplot(fig)
+
+# ✅ Show Predicted Price in UI
+st.write(f"### 📌 Predicted Price for {selected_month}: ₹{selected_price:.2f}")
+st.success("✅ Prediction Completed!")

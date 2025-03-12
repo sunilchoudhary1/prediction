@@ -1,103 +1,165 @@
+import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
 
-# Get stock symbol from user
-stock_symbol = input("Enter BSE stock symbol (e.g., RELIANCE.BO): ")
+# Load Model & Scaler
+model = load_model("stock_model.keras")
+scaler = np.load("scaler.npy", allow_pickle=True).item()
 
-# Fetch last 10 years of stock data
-start_date = (datetime.today() - timedelta(days=3650)).strftime('%Y-%m-%d')
-end_date = datetime.today().strftime('%Y-%m-%d')
+# Streamlit UI Configuration
+st.set_page_config(page_title="Stock Price Prediction", layout="wide")
+st.title("📈 Stock Price Prediction App")
+st.sidebar.header("🔍 Select Stock & Settings")
 
-df = yf.download(stock_symbol, start=start_date, end=end_date)
+# User Input: Stock Symbol
+stock_symbol = st.sidebar.text_input("Enter BSE stock symbol (e.g., RELIANCE.BO):", "RELIANCE.BO")
 
-# Plot stock prices
-plt.figure(figsize=(12,5))
-plt.plot(df['Close'], label="Closing Price")
-plt.title(f"{stock_symbol} Stock Price Over 10 Years")
-plt.xlabel("Date")
-plt.ylabel("Price")
-plt.legend()
-plt.show()
 
-# Prepare data for LSTM
-df_close = df[['Close']]
-scaler = MinMaxScaler(feature_range=(0,1))
-df_scaled = scaler.fit_transform(df_close)
+# Fetch Stock Data (Cache for Performance)
+@st.cache_data
+def fetch_stock_data(symbol):
+    df = yf.download(symbol, period="10y")
+    df.reset_index(inplace=True)
+    return df
 
-# Create sequences for training
-def create_sequences(data, time_step=60):
-    X, Y = [], []
-    for i in range(len(data) - time_step - 1):
-        X.append(data[i:(i + time_step), 0])
-        Y.append(data[i + time_step, 0])
-    return np.array(X), np.array(Y)
 
-time_step = 60  # Using past 60 days to predict next day
-X, Y = create_sequences(df_scaled, time_step)
-X = X.reshape(X.shape[0], X.shape[1], 1)  # Reshaping for LSTM
+df = fetch_stock_data(stock_symbol)
 
-# Split data into train & test sets (80% training, 20% testing)
-train_size = int(len(X) * 0.8)
-X_train, X_test = X[:train_size], X[train_size:]
-Y_train, Y_test = Y[:train_size], Y[train_size:]
+# Stop if No Data Found
+if df.empty:
+    st.error("❌ No data found. Try another stock.")
+    st.stop()
 
-# Build LSTM Model
-model = Sequential([
-    LSTM(100, return_sequences=True, input_shape=(time_step, 1)),
-    Dropout(0.2),
-    LSTM(100, return_sequences=False),
-    Dropout(0.2),
-    Dense(25),
-    Dense(1)
-])
+# Convert Date Column
+df['Date'] = pd.to_datetime(df['Date'])
 
-# Compile Model
-model.compile(optimizer='adam', loss='mean_squared_error')
+# Moving Average for Smoother Trend Analysis
+df['MA50'] = df['Close'].rolling(window=50).mean()
 
-# Train Model
-history = model.fit(X_train, Y_train, epochs=50, batch_size=32, validation_data=(X_test, Y_test))
+# Prepare Close Prices for Prediction
+df_close = df[['Close']].values
+df_scaled = scaler.transform(df_close)
 
-# Plot Training Loss
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title("Loss Curve")
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.legend()
-plt.show()
+# User Input: Future Months
+future_months = st.sidebar.slider("📅 Predict Future Months:", 1, 24, 12)
 
-# Predict Next 2 Years
-future_days = 730  # 2 years
+# Prediction Process
+time_step = 60
 future_inputs = df_scaled[-time_step:].reshape(1, time_step, 1)
+future_preds, future_dates = [], []
+last_date = df['Date'].iloc[-1]
 
-future_preds = []
-for _ in range(future_days):
-    pred = model.predict(future_inputs)[0][0]
+for i in range(future_months):
+    pred = model.predict(future_inputs, verbose=0)[0][0]
     future_preds.append(pred)
     future_inputs = np.append(future_inputs[:, 1:, :], [[[pred]]], axis=1)
+    next_month = last_date + timedelta(days=30 * (i + 1))
+    future_dates.append(next_month)
 
-# Convert Predictions Back to Original Scale
+# Convert Predictions to Original Scale
 future_preds = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
 
-# Create Future Dates
-future_dates = [df.index[-1] + timedelta(days=i) for i in range(1, future_days+1)]
+# Create Prediction DataFrame
+pred_df = pd.DataFrame({'Date': future_dates, 'Predicted Close': future_preds.flatten()})
 
-# Plot Future Predictions
-plt.figure(figsize=(12,5))
-plt.plot(df.index, df['Close'], label="Historical Prices")
-plt.plot(future_dates, future_preds, label="Predicted Prices (Next 2 Years)", linestyle="dashed")
-plt.xlabel("Date")
-plt.ylabel("Stock Price")
-plt.title(f"Future Stock Price Prediction for {stock_symbol}")
-plt.legend()
-plt.show()
+# Fill the gap between last known value and future predictions
+gap_filler_dates = pd.date_range(start=last_date, end=future_dates[0], periods=10)[1:]
+gap_filler_values = np.linspace(df['Close'].iloc[-1], future_preds[0][0], num=len(gap_filler_dates))
+gap_df = pd.DataFrame({'Date': gap_filler_dates, 'Predicted Close': gap_filler_values.flatten()})
+pred_df = pd.concat([gap_df, pred_df], ignore_index=True)
 
-# Save the trained model
-model.save("bse_stock_lstm_model.h5")
-print("Model saved successfully!")
+# Select Month for Display
+months = [date.strftime('%B %Y') for date in pred_df['Date']]
+selected_month = st.sidebar.selectbox("📅 Select a month for prediction:", months)
+selected_index = months.index(selected_month)
+selected_price = float(pred_df['Predicted Close'].iloc[selected_index])
+
+# Generate Headline Based on Prediction Trend
+price_change = float(selected_price) - float(df['Close'].iloc[-1])
+
+if price_change > 0:
+    headline = f"🚀 **Stock Price Surge Expected!** {stock_symbol} is projected to rise by ₹{price_change:.2f}."
+elif price_change < 0:
+    headline = f"📉 **Stock Price Drop Alert!** {stock_symbol} might decline by ₹{abs(price_change):.2f}."
+else:
+    headline = f"📊 **Stable Market Ahead!** No major change expected for {stock_symbol}."
+
+# ✅ Enhanced Graph Visualization
+theme_color = "#1E90FF"  # Blue Theme
+fig = go.Figure()
+
+# Candlestick Chart for Historical Prices
+fig.add_trace(go.Candlestick(
+    x=df['Date'].tail(100),
+    open=df['Open'].tail(100),
+    high=df['High'].tail(100),
+    low=df['Low'].tail(100),
+    close=df['Close'].tail(100),
+    name="Historical Prices",
+    increasing_line_color='#32CD32',
+    decreasing_line_color='#FF4500',
+    opacity=0.7
+))
+
+# Moving Average (MA50)
+fig.add_trace(go.Scatter(
+    x=df['Date'].tail(100),
+    y=df['MA50'].tail(100),
+    mode='lines',
+    name='50-Day MA',
+    line=dict(color='#FFD700', width=2, dash='dot')
+))
+
+# Predicted Prices with Gap Filling
+fig.add_trace(go.Scatter(
+    x=pred_df['Date'],
+    y=pred_df['Predicted Close'],
+    mode='lines+markers',
+    name='Predicted Prices',
+    line=dict(color=theme_color, width=2, dash='solid'),
+    marker=dict(color=theme_color, size=6, symbol="circle-open")
+))
+
+# Highlight Selected Month Prediction with Annotation
+fig.add_trace(go.Scatter(
+    x=[pred_df['Date'].iloc[selected_index]],
+    y=[selected_price],
+    mode='markers+text',
+    marker=dict(color='black', size=12, symbol="star"),
+    text=[f'₹{selected_price:.2f}'],
+    textposition="top center",
+    name=f'Prediction for {selected_month}'
+))
+
+# ✅ Chart Customization
+fig.update_layout(
+    title=f"📊 {stock_symbol} Stock Price Prediction",
+    xaxis_title="Date",
+    yaxis_title="Stock Price",
+    template="plotly_white",
+    plot_bgcolor='rgba(240,240,240,0.9)',
+    paper_bgcolor='white',
+    xaxis_rangeslider_visible=False,
+    height=700,
+    width=1200,
+    font=dict(family="Arial", size=14),
+    hovermode="x unified",
+    xaxis=dict(showgrid=True, gridcolor='LightGray'),
+    yaxis=dict(showgrid=True, gridcolor='LightGray')
+)
+
+# ✅ Display Graph in Streamlit
+st.plotly_chart(fig, use_container_width=True)
+
+# ✅ Show Prediction Headline
+st.markdown(f"## {headline}")
+
+# ✅ Show Predicted Price in UI
+st.markdown(f"### 📌 Predicted Price for **{selected_month}**: ₹{selected_price:.2f}")
+
+st.success("✅ Prediction Completed! 🎯")
