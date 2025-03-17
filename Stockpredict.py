@@ -1,96 +1,83 @@
-import streamlit as st
+from turtle import st
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime, timedelta
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
 
-# Load Model & Scaler
-model = load_model("stock_model.keras")
-scaler = np.load("scaler.npy", allow_pickle=True).item()
-
-# Streamlit UI Configuration
-st.set_page_config(page_title="Stock Price Prediction", layout="wide")
-st.title("📈 Stock Price Prediction App")
-st.sidebar.header("🔍 Select Stock & Settings")
-
-# User Input: Stock Symbol
-stock_symbol = st.sidebar.text_input("Enter BSE stock symbol (e.g., RELIANCE.BO):", "RELIANCE.BO")
 
 # Fetch Stock Data
 @st.cache_data
 def fetch_stock_data(symbol):
-    df = yf.download(symbol, period="10y")
-    df.reset_index(inplace=True)
-    return df
+    try:
+        df = yf.download(symbol, period="10y")  # Try fetching 10 years of data
+        if df.empty:  # If no data, try maximum available data
+            df = yf.download(symbol, period="max")
+        df.reset_index(inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"⚠️ Error fetching data: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame on failure
 
-df = fetch_stock_data(stock_symbol)
 
-# Stop if no data is found
-if df.empty:
-    st.error("❌ No data found. Try another stock.")
-    st.stop()
+# Compute RSI Indicator
+def compute_rsi(data, window=14):
+    delta = data.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=window).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# Convert Date Column
-df['Date'] = pd.to_datetime(df['Date'])
-df_close = df[['Close']].values
-df_scaled = scaler.transform(df_close)
 
-# User Input: Future Months
-future_months = st.sidebar.slider("📅 Predict Future Months:", 1, 24, 12)
+# Prepare Data for LSTM
+def prepare_lstm_data(data, time_step=60):
+    X, y = [], []
+    for i in range(len(data) - time_step):
+        X.append(data[i:(i + time_step), :])
+        y.append(data[i + time_step, 0])
+    return np.array(X), np.array(y)
 
-# Prediction Process
-time_step = 60
-future_inputs = df_scaled[-time_step:].reshape(1, time_step, 1)
-future_preds, future_dates = [], []
-last_date = df['Date'].iloc[-1]
 
-for i in range(future_months):
-    pred = model.predict(future_inputs, verbose=0)[0][0]
-    future_preds.append(pred)
-    future_inputs = np.append(future_inputs[:, 1:, :], [[[pred]]], axis=1)
-    next_month = last_date + timedelta(days=30 * (i + 1))
-    future_dates.append(next_month)
+# Train and Save Model
+def train_model(stock_symbol="WIPRO.BO", time_step=60):
+    print(f"Fetching data for {stock_symbol}...")
+    df = fetch_stock_data(stock_symbol)
 
-# Convert Predictions to Original Scale
-future_preds = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
+    if df.empty:
+        print("❌ No data found. Exiting...")
+        return
 
-# Create Prediction DataFrame
-pred_df = pd.DataFrame({'Date': future_dates, 'Predicted Close': future_preds.flatten()})
+    df['RSI'] = compute_rsi(df['Close'])
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    df['SMA_200'] = df['Close'].rolling(window=200).mean()
 
-# Select Month for Display
-months = [date.strftime('%B %Y') for date in future_dates]
-selected_month = st.sidebar.selectbox("📅 Select a month for prediction:", months)
-selected_index = months.index(selected_month)
-selected_price = future_preds[selected_index][0]
+    feature_columns = ['Close', 'Volume', 'RSI', 'SMA_50', 'SMA_200']
+    df.fillna(method='bfill', inplace=True)
 
-# ✅ Bar Chart (Replaces Line Chart)
-fig, ax = plt.subplots(figsize=(12, 6))
-sns.set_style("whitegrid")
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    data_scaled = scaler.fit_transform(df[feature_columns])
 
-# Plot Historical Prices as Bars
-ax.bar(df['Date'][-50:], df['Close'][-50:], label="Historical Prices", color="#0174DF", alpha=0.7)
+    X, y = prepare_lstm_data(data_scaled, time_step)
+    X = X.reshape(X.shape[0], time_step, X.shape[2])
 
-# Plot Predicted Prices as Bars
-ax.bar(pred_df['Date'], pred_df['Predicted Close'], label="Predicted Prices", color="#DF0101", alpha=0.7)
+    print("Training LSTM Model...")
+    model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(time_step, X.shape[2])),
+        Dropout(0.3),
+        LSTM(64, return_sequences=False),
+        Dropout(0.3),
+        Dense(32, activation='relu'),
+        Dense(1)
+    ])
 
-# Highlight Selected Prediction as a Separate Bar
-ax.bar(pred_df['Date'].iloc[selected_index], selected_price, color="black", label=f"Prediction for {selected_month}")
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.fit(X, y, epochs=50, batch_size=16, verbose=1)
 
-# Customize Graph Appearance
-ax.spines['top'].set_visible(False)
-ax.spines['right'].set_visible(False)
-ax.set_xlabel("Date", fontsize=12)
-ax.set_ylabel("Closing Price", fontsize=12)
-ax.set_title(stock_symbol, fontsize=16)
-ax.legend()
+    model.save("stock_model.keras")
+    print("✅ Model saved successfully!")
 
-# ✅ Display Bar Chart in Streamlit
-st.pyplot(fig)
 
-# ✅ Show Predicted Price in UI
-st.write(f"### 📌 Predicted Price for {selected_month}: ₹{selected_price:.2f}")
-st.success("✅ Prediction Completed!")
+if __name__ == "__main__":
+    train_model()
